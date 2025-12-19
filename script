@@ -1,0 +1,258 @@
+import os
+import json
+import time
+from datetime import datetime, timezone
+
+import requests
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+# Required env vars
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "").strip()
+
+# Channel IDs are best practice (more reliable than names)
+# Example: C0123ABCDEF
+SLACK_CHANNEL_CRITICAL = os.getenv("SLACK_CHANNEL_CRITICAL", "").strip()
+SLACK_CHANNEL_HIGH = os.getenv("SLACK_CHANNEL_HIGH", "").strip()
+SLACK_CHANNEL_MEDIUM = os.getenv("SLACK_CHANNEL_MEDIUM", "").strip()
+SLACK_CHANNEL_LOW = os.getenv("SLACK_CHANNEL_LOW", "").strip()
+
+# Optional: if you only want to notify for certain severities, set:
+# ALERT_MIN_SEVERITY=Medium or High or Critical
+ALERT_MIN_SEVERITY = os.getenv("ALERT_MIN_SEVERITY", "Low").strip()
+
+# Optional: shared secret to validate requests (simple gate)
+WEBHOOK_SHARED_SECRET = os.getenv("WEBHOOK_SHARED_SECRET", "").strip()
+
+
+SEVERITY_ORDER = {
+    "Low": 1,
+    "Medium": 2,
+    "High": 3,
+    "Critical": 4,
+}
+
+CHANNEL_BY_SEVERITY = {
+    "Critical": SLACK_CHANNEL_CRITICAL,
+    "High": SLACK_CHANNEL_HIGH,
+    "Medium": SLACK_CHANNEL_MEDIUM,
+    "Low": SLACK_CHANNEL_LOW,
+}
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _normalize_severity(value) -> str:
+    """
+    CrowdStrike payloads vary. We normalize severity into:
+    Low, Medium, High, Critical
+    """
+    if value is None:
+        return "Medium"
+
+    # If numeric, map roughly (common pattern: 1-10 or 0-100)
+    if isinstance(value, (int, float)):
+        n = float(value)
+        if n >= 9:
+            return "Critical"
+        if n >= 7:
+            return "High"
+        if n >= 4:
+            return "Medium"
+        return "Low"
+
+    s = str(value).strip().lower()
+    if s in ["critical", "crit"]:
+        return "Critical"
+    if s in ["high"]:
+        return "High"
+    if s in ["medium", "med", "moderate"]:
+        return "Medium"
+    if s in ["low"]:
+        return "Low"
+
+    # Fallback
+    return "Medium"
+
+
+def _meets_threshold(sev: str) -> bool:
+    min_sev = _normalize_severity(ALERT_MIN_SEVERITY)
+    return SEVERITY_ORDER.get(sev, 2) >= SEVERITY_ORDER.get(min_sev, 1)
+
+
+def _extract_detection_fields(payload: dict) -> dict:
+    """
+    Try best-effort extraction from different possible shapes.
+
+    We look in:
+    - payload["event"]
+    - payload["data"]
+    - payload itself
+    """
+    event = payload.get("event") or payload.get("data") or payload
+
+    severity = _normalize_severity(
+        event.get("severity") or event.get("Severity") or event.get("severity_label")
+    )
+
+    hostname = (
+        event.get("hostname")
+        or event.get("device_name")
+        or event.get("host_name")
+        or event.get("HostName")
+        or "Unknown host"
+    )
+
+    username = (
+        event.get("username")
+        or event.get("user")
+        or event.get("UserName")
+        or event.get("account_name")
+        or "Unknown user"
+    )
+
+    description = (
+        event.get("description")
+        or event.get("message")
+        or event.get("summary")
+        or event.get("DetectionDescription")
+        or "No description provided"
+    )
+
+    detection_id = (
+        event.get("detection_id")
+        or event.get("id")
+        or event.get("DetectionId")
+        or ""
+    )
+
+    # Timestamp can arrive in different formats. We keep a fallback.
+    ts = event.get("timestamp") or event.get("time") or event.get("created_at") or ""
+    if not ts:
+        ts = _now_utc_iso()
+
+    # Optional helpful fields
+    tactic = event.get("tactic") or event.get("Tactic") or ""
+    technique = event.get("technique") or event.get("Technique") or ""
+    file_name = event.get("file_name") or event.get("FileName") or ""
+    process = event.get("process_name") or event.get("ProcessName") or ""
+    cmdline = event.get("command_line") or event.get("CommandLine") or ""
+    ip = event.get("ip") or event.get("source_ip") or ""
+
+    return {
+        "severity": severity,
+        "hostname": hostname,
+        "username": username,
+        "description": description,
+        "timestamp": ts,
+        "detection_id": detection_id,
+        "tactic": tactic,
+        "technique": technique,
+        "file_name": file_name,
+        "process": process,
+        "cmdline": cmdline,
+        "ip": ip,
+    }
+
+
+def _build_slack_text(d: dict) -> str:
+    sev_emoji = {
+        "Critical": "🛑",
+        "High": "🚨",
+        "Medium": "⚠️",
+        "Low": "ℹ️",
+    }.get(d["severity"], "⚠️")
+
+    lines = [
+        f"{sev_emoji} CrowdStrike Detection Alert",
+        "",
+        f"Severity: {d['severity']}",
+        f"Host: {d['hostname']}",
+        f"User: {d['username']}",
+        f"Time: {d['timestamp']}",
+        "",
+        f"Detection: {d['description']}",
+    ]
+
+    # Add optional context if present
+    if d["process"]:
+        lines.append(f"Process: {d['process']}")
+    if d["file_name"]:
+        lines.append(f"File: {d['file_name']}")
+    if d["ip"]:
+        lines.append(f"IP: {d['ip']}")
+    if d["tactic"] or d["technique"]:
+        lines.append(f"MITRE: {d['tactic']} {d['technique']}".strip())
+    if d["cmdline"]:
+        lines.append(f"Cmdline: {d['cmdline']}")
+
+    if d["detection_id"]:
+        lines.append("")
+        lines.append(f"Detection ID: {d['detection_id']}")
+
+    lines.append("")
+    lines.append("Recommended: Review in Falcon console and confirm with the user if needed.")
+
+    return "\n".join(lines)
+
+
+def _post_to_slack(channel_id: str, text: str) -> None:
+    if not SLACK_BOT_TOKEN:
+        raise RuntimeError("Missing SLACK_BOT_TOKEN")
+    if not channel_id:
+        raise RuntimeError("Missing Slack channel ID for this severity")
+
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    payload = {
+        "channel": channel_id,
+        "text": text,
+    }
+
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+    data = resp.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack API error: {data}")
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/crowdstrike/webhook", methods=["POST"])
+def crowdstrike_webhook():
+    # Simple shared secret gate (optional but recommended)
+    if WEBHOOK_SHARED_SECRET:
+        incoming = request.headers.get("X-Webhook-Secret", "")
+        if incoming != WEBHOOK_SHARED_SECRET:
+            return jsonify({"status": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    detection = _extract_detection_fields(payload)
+
+    severity = detection["severity"]
+    if not _meets_threshold(severity):
+        return jsonify({"status": "ignored", "reason": "below_threshold", "severity": severity}), 200
+
+    channel_id = CHANNEL_BY_SEVERITY.get(severity) or SLACK_CHANNEL_MEDIUM
+    text = _build_slack_text(detection)
+
+    try:
+        _post_to_slack(channel_id, text)
+        return jsonify({"status": "sent", "severity": severity, "channel": channel_id}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+if __name__ == "__main__":
+    # Local dev: python app.py
+    # Prod: use gunicorn
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
