@@ -1,0 +1,169 @@
+Step 1. Create a Slack channel for security alerts
+
+First you want a place where alerts will go.
+
+Example channel name:
+
+#security-alerts
+
+or
+
+#soc-alerts
+
+This keeps security notifications separate from normal IT chatter.
+
+Typical alerts you want here:
+
+Malware detection
+
+Suspicious behavior
+
+Endpoint containment events
+
+High severity threats
+
+Step 2. Create a Slack Incoming Webhook
+
+Slack needs a way for external systems to send messages into the channel.
+
+Think of the webhook as a secure URL that accepts alerts.
+
+Steps in Slack:
+
+Go to Slack App Directory
+
+Search for Incoming Webhooks
+
+Click Add to Slack
+
+Choose the channel (ex: #security-alerts)
+
+Slack will generate a URL like:
+
+https://hooks.slack.com/services/TXXXX/BXXXX/XXXX
+
+Save this URL.
+This is what CrowdStrike will use to send alerts.
+
+Step 3. Go to CrowdStrike Falcon console
+
+Login to:
+
+CrowdStrike Falcon Dashboard
+
+Then go to:
+
+Platform → Falcon Fusion Workflows
+
+Falcon Fusion is CrowdStrike’s automation engine.
+
+This is where you build workflows like:
+
+If detection occurs → send Slack alert
+Step 4. Create a new workflow
+
+Click:
+
+Create Workflow
+
+Name it something clear:
+
+Send Security Alerts to Slack
+
+Now we configure the automation.
+
+Step 5. Define the trigger
+
+The trigger is what event starts the automation.
+
+Choose:
+
+Trigger Type
+
+Detection Created
+
+This means whenever CrowdStrike detects a threat on a device.
+
+Step 6. Filter by severity
+
+You probably don’t want every small alert going to Slack.
+
+Add a condition:
+
+Severity = Medium OR High OR Critical
+
+Example logic:
+
+IF Detection Severity >= Medium
+
+This prevents low noise alerts.
+
+Step 7. Add the action (Send to Slack)
+
+Now define what happens when the trigger fires.
+
+Choose:
+
+Action → Webhook
+
+Paste the Slack webhook URL you created earlier.
+
+Step 8. Format the alert message
+
+You want the message to include useful security information.
+
+Example message format:
+
+Security Alert from CrowdStrike
+
+Severity: High
+Host: MacBook-Johnny
+User: johnny.le
+Threat: Credential Dumping
+
+View Detection:
+https://falcon.crowdstrike.com/detections
+
+This helps the security team immediately understand:
+
+which machine
+
+which user
+
+what type of threat
+
+where to investigate
+
+Step 9. Test the workflow
+
+Before going live, test it.
+
+You can:
+
+Trigger a test detection
+
+Or use a workflow test option
+
+Then confirm Slack receives something like:
+
+CrowdStrike Detection Alert
+
+Severity: High
+Host: macbook-23
+User: jsmith
+Threat: Malware Execution
+
+If the message appears in Slack, the automation works.
+
+Step 10. Activate the workflow
+
+Finally:
+
+Click Enable Workflow
+
+Now CrowdStrike will automatically send Slack alerts whenever:
+
+Medium
+High
+Critical
+detections occur
